@@ -1,0 +1,443 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<policy xmlns="http://www.mulesoft.org/schema/mule/policy"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xmlns:spring="http://www.springframework.org/schema/beans"
+        xmlns:mule="http://www.mulesoft.org/schema/mule/core"
+        xmlns:scripting="http://www.mulesoft.org/schema/mule/scripting"
+        xmlns:mule-ss="http://www.mulesoft.org/schema/mule/spring-security"
+        xmlns:ss="http://www.springframework.org/schema/security"
+        xmlns:api-platform-gw="http://www.mulesoft.org/schema/mule/api-platform-gw"
+        xsi:schemaLocation="http://www.mulesoft.org/schema/mule/policy http://www.mulesoft.org/schema/mule/policy/current/mule-policy.xsd
+              http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+              http://www.mulesoft.org/schema/mule/scripting http://www.mulesoft.org/schema/mule/scripting/current/mule-scripting.xsd
+              http://www.mulesoft.org/schema/mule/spring-security http://www.mulesoft.org/schema/mule/spring-security/current/mule-spring-security.xsd
+              http://www.springframework.org/schema/security http://www.springframework.org/schema/security/spring-security-current.xsd
+              http://www.mulesoft.org/schema/mule/api-platform-gw http://www.mulesoft.org/schema/mule/api-platform-gw/current/mule-api-platform-gw.xsd
+              http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd">
+    <!--
+        This is a custom policy example to help you get started.
+        It's a policy that filters HTTP requests based on a MEL expression.
+
+        The policy has two configuration parameters (see the YAML file):
+        - query: a MEL expression to determine which messages to filter.
+        - denied-message: a message to display in the response when the
+          filter is applied.
+
+        For more information about creating custom policies see:
+        https://docs.mulesoft.com/api-manager/creating-a-policy-walkthrough
+        and
+        https://docs.mulesoft.com/api-manager/applying-custom-policies
+    -->
+
+    <!--
+        A pointcut controls the scope of a policy application. You can use
+        different types of conditions to determine if the policy must be
+        applied.
+
+        api-platform-gw:api-pointcut: Applies the policy to a particular API.
+        apiName/apiVersion values are compared against the auto-discovery
+        global element defined in your Mule project.
+        See: https://docs.mulesoft.com/api-manager/api-auto-discovery
+
+        For other kinds of pointcut conditions see: 
+        https://docs.mulesoft.com/api-manager/applying-custom-policies
+    -->
+    <pointcut>
+        <!--
+            This file is a policy template, in the final XML deployed to Mule
+            the names surrounded by double bracket will be replaced with
+            configuration parameters.
+        -->
+        <api-platform-gw:api-pointcut apiName="{{ apiName }}" apiVersion="{{ apiVersionName }}"/>
+    </pointcut>
+
+    <!-- 
+        The before tag executes before your API flows. In this tag you can
+        filter or manipulate the incoming message.
+    -->
+    <before>
+        <mule:set-variable variableName="host" value="{{ icapHost }}" />
+        <mule:set-variable variableName="port" value="{{ icapPort }}" />
+        <!--
+            When a message fails to satisfy the conditions specified by a
+            filter, that filter returns a null value, which causes the
+            processing of that particular message to halt. In other words,
+            the message is rejected and undergoes no further processing.
+
+            See: https://docs.mulesoft.com/mule-user-guide/v/3.8/filters
+        -->
+        <mule:foreach collection="{{ attachment-expression }}" >
+        <scripting:component>
+            <scripting:script engine="Groovy"><![CDATA[  
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.Socket
+import java.nio.charset.Charset
+import java.util.Arrays
+import java.util.HashMap
+import java.util.Map
+
+class ICAP 
+    {private static final Charset StandardCharsetsUTF8 = Charset.forName("UTF-8")
+
+
+    private String serverIP
+    private int port
+
+    private Socket client = null
+    private DataOutputStream out
+    private DataInputStream inputStream
+
+    private String icapService
+    private final String VERSION = "1.0"
+    private final String USERAGENT = "IT-Kartellet ICAP Client/1.1"
+    private final String ICAPTERMINATOR = "\r\n\r\n"
+    private final String HTTPTERMINATOR = "0\r\n\r\n"
+
+    private int stdPreviewSize
+    private final int stdRecieveLength = 8192
+    private final int stdSendLength = 8192
+
+    private String tempString
+
+    ICAP(String serverIP, int port, String icapService) throws IOException {
+        this.icapService = icapService
+        this.serverIP = serverIP
+        this.port = port
+
+        try {
+            client = new Socket(this.serverIP, this.port)
+            if (null == client) {
+                String subject = "Could not open socket connection to ICAP server"
+                String body = subject + ": " + this.serverIP + " Port: " + this.port
+                ICAPException icapException = new ICAPException(body)
+
+                throw icapException
+			}
+		} catch (Exception e) {
+            String subject = "Could not open socket connection to ICAP server"
+            String body = subject + ": " + this.serverIP + " Port: " + this.port
+            ICAPException icapException = new ICAPException(body)
+
+            throw icapException
+		}
+
+        OutputStream outToServer = client.getOutputStream()
+        out = new DataOutputStream(outToServer)
+
+        InputStream inFromServer = client.getInputStream()
+        inputStream = new DataInputStream(inFromServer)
+
+        String parseMe = getOptions()
+        Map<String, String> responseMap = parseHeader(parseMe)
+
+        if (responseMap.get("StatusCode") != null) {
+            int status = Integer.parseInt(responseMap.get("StatusCode"))
+
+            switch (status) {
+                case 200: 
+                    tempString = responseMap.get("Preview"); 
+                    if (tempString != null){ 
+                        stdPreviewSize=Integer.parseInt(tempString); 
+                    }
+                    break
+                 case 404:
+                        String body = "ICAP Service " + icapService + " not found."
+                        ICAPException icapException = new ICAPException(body)
+
+                        throw icapException
+					break
+                default:
+                        ICAPException icapException = new ICAPException("Could not get preview size from icap server.")
+
+                        throw icapException
+                    break
+			}
+		} else {
+            ICAPException icapException = new ICAPException("Could not get options from icap server.")
+
+            throw icapException
+		}
+	}
+
+
+    ICAP(String serverIP, int port, String icapService, int previewSize) throws IOException{
+        this.icapService = icapService
+        this.serverIP = serverIP
+        this.port = port
+
+        if ((client = new Socket(serverIP, port)) == null) {
+
+            throw new ICAPException("Could not open socket connection to icap server.")
+		}
+
+        OutputStream outToServer = client.getOutputStream()
+        out = new DataOutputStream(outToServer)
+
+
+        InputStream inFromServer = client.getInputStream()
+        inputStream = new DataInputStream(inFromServer)
+
+        stdPreviewSize = previewSize
+	}
+
+
+    boolean scanStream(InputStream iStream) throws IOException{
+
+        try {
+            int fileSize = iStream.available()
+
+            String resBody = "Content-Length: " + fileSize + "\r\n\r\n"
+
+            int previewSize = stdPreviewSize
+            if (fileSize < stdPreviewSize) {
+                previewSize = fileSize
+			}
+
+            String requestBuffer = "RESPMOD icap://" + serverIP + "/" + icapService + " ICAP/" + VERSION + "\r\n" \
+             + "Host: " + serverIP + "\r\n" \
+             + "User-Agent: " + USERAGENT + "\r\n" \
+             + "Allow: 204\r\n" \
+             + "Preview: " + previewSize + "\r\n" \
+             + "Encapsulated: res-hdr=0, res-body=" + resBody.length() + "\r\n" \
+             + "\r\n" \
+             + resBody \
+             + Integer.toHexString(previewSize) + "\r\n"
+
+			sendString(requestBuffer)
+			byte[] chunk = new byte[previewSize]		
+            
+            iStream.read(chunk)
+            
+            sendBytes(chunk)
+            
+            sendString("\r\n")
+            if (fileSize <= previewSize) {
+                sendString("0; ieof\r\n\r\n")
+			} else if (previewSize != 0) {
+                sendString("0\r\n\r\n")
+			}
+
+            Map<String, String> responseMap = new HashMap<String, String>()
+            int status
+
+            if (fileSize > previewSize) {
+            	
+                String parseMe = getHeader(ICAPTERMINATOR)
+                
+                responseMap = parseHeader(parseMe)
+
+                tempString = responseMap.get("StatusCode")
+                if (tempString != null) {
+                    status = Integer.parseInt(tempString)
+        
+                    switch (status) {
+                        case 100:
+                        break 
+                        case 200:return false
+                        case 204:return true
+                        case 404:
+                                String body = "ICAP Service " + icapService + " not found."
+                                ICAPException icapException = new ICAPException(body)
+
+                                throw icapException
+						break
+                        default:
+                                String message = "Unknown status code " + status + " recieved from icap server."
+                                ICAPException icapException = new ICAPException(message)
+
+                                throw icapException
+					}
+				}
+			}
+
+
+            if (fileSize > previewSize) {
+                byte[] buffer = new byte[stdSendLength]
+                while (iStream.read(buffer) != -1) {
+                    sendString(Integer.toHexString(buffer.length) + "\r\n")
+                    sendBytes(buffer)
+                    sendString("\r\n")
+				}
+
+                requestBuffer = "0\r\n\r\n"
+                sendString(requestBuffer)
+			}
+
+            responseMap.clear()
+
+            String response = getHeader(ICAPTERMINATOR)
+            org.apache.logging.log4j.LogManager.getLogger(org.mule.api.processor.LoggerMessageProcessor.class).error(response)
+            
+            responseMap = parseHeader(response)
+
+			org.apache.logging.log4j.LogManager.getLogger(org.mule.api.processor.LoggerMessageProcessor.class).error(responseMap)
+            tempString = responseMap.get("StatusCode")
+            if (tempString != null) {
+                status = Integer.parseInt(tempString)
+
+                if (status == 204) {return true}
+
+                if (status == 200) {
+
+                    try {
+                        response = getHeader(HTTPTERMINATOR)
+
+                        responseMap = parseHeader(response)
+                        status = Integer.parseInt(responseMap.get("StatusCode"))
+                        if (status >= 400) {
+                            return false
+						}
+					} catch (ICAPException ice) {
+                        return false
+				    } catch (Exception e) {}
+                    return true
+				}
+			}
+
+            ICAPException icapException = new ICAPException("Unrecognized or no status code in response header from icap server.")
+
+            throw icapException
+		} finally {
+            if (iStream != null) {
+                iStream.close()
+			}
+		}
+	}
+
+    private String getOptions() throws IOException{
+
+
+        String requestHeader = "OPTIONS icap://" + serverIP + "/" + icapService + " ICAP/" + VERSION + "\r\n" \
+         + "Host: " + serverIP + "\r\n" \
+         + "User-Agent: " + USERAGENT + "\r\n" \
+         + "Encapsulated: null-body=0\r\n" \
+         + "\r\n"
+
+        sendString(requestHeader)
+        
+        return getHeader(ICAPTERMINATOR)
+	}
+
+    private String getHeader(String terminator) throws IOException{
+        byte[] endofheader = terminator.getBytes(StandardCharsetsUTF8)
+        byte[] buffer = new byte[stdRecieveLength]
+
+        int n
+        int offset = 0
+
+        while ((offset < stdRecieveLength) && (n = inputStream.read(buffer, offset, 1)) != -1) {
+            offset += n
+            if (offset > (endofheader.length + 13)) {
+            	byte[] lastBytes = Arrays.copyOfRange(buffer, offset - endofheader.length, offset)
+                if (Arrays.equals(endofheader, lastBytes)) {
+                	return new String(buffer, 0, offset, StandardCharsetsUTF8)
+				}
+			}
+		}
+		
+		ICAPException icapException = new ICAPException("Error in reading header from icap server response.")
+
+        throw icapException
+	}
+
+    private Map<String, String> parseHeader(String response) {
+        Map<String, String> headers = new HashMap<String, String>()
+
+        int x = response.indexOf(" ", 0)
+        int y = response.indexOf(" ", x + 1)
+        String statusCode = response.substring(x + 1, y)
+        headers.put("StatusCode", statusCode)
+
+        int i = response.indexOf("\r\n", y)
+        String statusMessage = response.substring(y + 1, i)
+        headers.put("StatusMessage", statusMessage)
+        i += 2
+        while (i + 2 != response.length() && response.substring(i).contains(":")) {
+
+            int n = response.indexOf(":", i)
+            String key = response.substring(i, n)
+
+            n += 2
+            i = response.indexOf("\r\n", n)
+            String value = response.substring(n, i)
+
+            headers.put(key, value)
+            i += 2
+		}
+		
+        return headers
+	}
+
+    private void sendString(String requestHeader) throws IOException{
+        out.write(requestHeader.getBytes(StandardCharsetsUTF8))
+	}
+
+    private void sendBytes(byte[] chunk) throws IOException{
+        for (int i = 0 ; i < chunk.length ; i++){
+            out.write(chunk[i])
+		}
+	}
+
+    private void disconnect() throws IOException{
+        if (client != null) {
+            client.close()
+		}
+	}
+
+    @Override 
+    protected void finalize() throws Throwable{
+        try {
+            disconnect()
+		} finally {
+            super.finalize()
+		}
+	}
+}
+
+class ICAPException extends Exception 
+    {ICAPException(String message) {
+        super(message)
+}
+}
+
+if (payload != null && ! (payload instanceof org.mule.transport.NullPayload)) {
+
+	org.apache.logging.log4j.LogManager.getLogger(org.mule.api.processor.LoggerMessageProcessor.class).info("{{{ icapHost }}}" + " " + {{{ icapPort }}} )
+		
+	def icapClient = new ICAP("{{{ icapHost }}}", {{{ icapPort }}}, "avscan")
+
+	payload = icapClient.scanStream(payload.getInputStream())
+	
+	org.apache.logging.log4j.LogManager.getLogger(org.mule.api.processor.LoggerMessageProcessor.class).info(payload)
+
+	return payload
+}
+]]></scripting:script>
+        </scripting:component>
+        <mule:choice>
+                <mule:when expression="#[payload == false]">
+                    <mule:logger message="Virus found" level="INFO"/>
+                </mule:when>
+                <mule:otherwise>
+                    <mule:logger message="No Virus found" level="INFO"/>
+                </mule:otherwise>
+         </mule:choice>
+        </mule:foreach>
+    </before>
+
+    <!--
+        The after is inserted after your API flows. With this tag you can
+        manipulate the API response.
+
+        Note that if the API flow is halted (ie. by a filter) the after
+        tag will not run. In this example, the after tag is not executed
+        when the message is filtered.
+    -->
+    <after>
+        <mule:set-property propertyName="Custom-Header" value="Example Policy" />
+    </after>
+</policy>
